@@ -445,6 +445,16 @@ unaware of which concrete implementation it's talking to.
   best-effort, manually maintained list that must be refreshed every January
   from the official NSE holiday circular; it is not sourced from a live
   calendar API/library in Phase 1.
+- **Stored `current_price` is Claude's validated echo, not the raw fetched
+  price** — the `current_price` stored in each prediction row comes from
+  `validated["current_price"]` in `src/prediction/engine.py`, i.e. the value
+  Claude echoed back in its JSON response, not the original market-fetched
+  price directly. `validate_response()` only checks that this echo is within
+  a tight tolerance of the price actually sent (max 1% of price, or ₹0.5,
+  whichever is larger) — it does not overwrite Claude's number with the
+  original. This is an accepted tradeoff: practical drift is immaterial to
+  downstream accuracy calculations, but it means the stored value is not
+  byte-identical to the price used to compute that row's indicators.
 
 ## 14. Running tests
 

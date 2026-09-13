@@ -105,7 +105,7 @@ def request_prediction(client, symbol: str, current_price: float, technical_scor
         try:
             response = client.messages.create(
                 model=CLAUDE_MODEL,
-                max_tokens=2000,
+                max_tokens=4000,
                 messages=[{"role": "user", "content": prompt}],
             )
             # The real Anthropic SDK can return non-text content blocks (e.g. extended-thinking
