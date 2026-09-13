@@ -53,26 +53,43 @@ def validate_response(raw_text: str, expected_current_price: float) -> dict[str,
     except json.JSONDecodeError as exc:
         raise PredictionValidationError(f"invalid JSON: {exc}") from exc
 
+    if not isinstance(data, dict):
+        raise PredictionValidationError("response is not a JSON object")
+
     if "current_price" not in data or "horizons" not in data:
         raise PredictionValidationError("missing current_price or horizons key")
 
-    if abs(float(data["current_price"]) - expected_current_price) > max(0.01 * expected_current_price, 0.5):
+    try:
+        price_matches = abs(float(data["current_price"]) - expected_current_price) <= max(
+            0.01 * expected_current_price, 0.5
+        )
+    except (ValueError, TypeError) as exc:
+        raise PredictionValidationError(f"current_price is not numeric: {exc}") from exc
+    if not price_matches:
         raise PredictionValidationError("current_price echoed back does not match sent value")
 
     horizons = data["horizons"]
+    if not isinstance(horizons, dict):
+        raise PredictionValidationError("horizons is not a JSON object")
     missing_horizons = set(HORIZONS) - set(horizons)
     if missing_horizons:
         raise PredictionValidationError(f"missing horizon keys: {missing_horizons}")
 
     for key, horizon in horizons.items():
+        if not isinstance(horizon, dict):
+            raise PredictionValidationError(f"horizon {key} is not a JSON object")
         missing_fields = REQUIRED_HORIZON_FIELDS - set(horizon)
         if missing_fields:
             raise PredictionValidationError(f"horizon {key} missing fields: {missing_fields}")
         if horizon["direction"] not in ALLOWED_DIRECTIONS:
             raise PredictionValidationError(f"horizon {key} invalid direction: {horizon['direction']}")
-        if not (float(horizon["range_low"]) <= float(horizon["range_high"])):
+        try:
+            range_ok = float(horizon["range_low"]) <= float(horizon["range_high"])
+            confidence = float(horizon["confidence"])
+        except (ValueError, TypeError) as exc:
+            raise PredictionValidationError(f"horizon {key} has malformed field: {exc}") from exc
+        if not range_ok:
             raise PredictionValidationError(f"horizon {key} range_low > range_high")
-        confidence = float(horizon["confidence"])
         if not (0 <= confidence <= 100):
             raise PredictionValidationError(f"horizon {key} confidence out of range: {confidence}")
         key_risks = horizon["key_risks"]
@@ -85,12 +102,16 @@ def validate_response(raw_text: str, expected_current_price: float) -> dict[str,
 def request_prediction(client, symbol: str, current_price: float, technical_score: float, indicators: dict[str, Any]) -> dict[str, Any] | None:
     prompt = build_prompt(symbol, current_price, technical_score, indicators)
     for attempt in range(2):
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw_text = response.content[0].text
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw_text = response.content[0].text
+        except Exception as exc:
+            logger.warning("Claude API call failed for %s (attempt %d): %s", symbol, attempt + 1, exc)
+            continue
         try:
             validated = validate_response(raw_text, current_price)
             validated["_raw_response"] = raw_text

@@ -81,6 +81,34 @@ def test_validate_response_rejects_mismatched_current_price():
         validate_response(json.dumps(_valid_payload(current_price=999.0)), expected_current_price=1450.0)
 
 
+def test_validate_response_rejects_non_numeric_field():
+    payload = _valid_payload()
+    payload["horizons"]["1d"]["confidence"] = "N/A"
+    with pytest.raises(PredictionValidationError):
+        validate_response(json.dumps(payload), expected_current_price=1450.0)
+
+
+def test_validate_response_rejects_non_dict_payload():
+    with pytest.raises(PredictionValidationError):
+        validate_response(json.dumps(None), expected_current_price=1450.0)
+    with pytest.raises(PredictionValidationError):
+        validate_response(json.dumps([1, 2, 3]), expected_current_price=1450.0)
+
+
+def test_validate_response_rejects_missing_field_within_horizon():
+    payload = _valid_payload()
+    del payload["horizons"]["1d"]["reasoning"]
+    with pytest.raises(PredictionValidationError):
+        validate_response(json.dumps(payload), expected_current_price=1450.0)
+
+
+def test_validate_response_rejects_missing_top_level_key_entirely():
+    payload = _valid_payload()
+    del payload["horizons"]
+    with pytest.raises(PredictionValidationError):
+        validate_response(json.dumps(payload), expected_current_price=1450.0)
+
+
 class _FakeMessage:
     def __init__(self, text):
         self.content = [type("Block", (), {"text": text})()]
@@ -92,9 +120,11 @@ class _FakeMessages:
         self.calls = 0
 
     def create(self, **kwargs):
-        text = self._texts[self.calls]
+        item = self._texts[self.calls]
         self.calls += 1
-        return _FakeMessage(text)
+        if isinstance(item, Exception):
+            raise item
+        return _FakeMessage(item)
 
 
 class _FakeClient:
@@ -111,6 +141,20 @@ def test_request_prediction_retries_once_then_succeeds():
 
 def test_request_prediction_returns_none_after_two_failures():
     client = _FakeClient(["not json", "still not json"])
+    result = request_prediction(client, "TCS.NS", 1450.0, 42.5, {"rsi14": 55.0})
+    assert result is None
+    assert client.messages.calls == 2
+
+
+def test_request_prediction_retries_when_api_call_raises_then_succeeds():
+    client = _FakeClient([RuntimeError("rate limited"), json.dumps(_valid_payload())])
+    result = request_prediction(client, "TCS.NS", 1450.0, 42.5, {"rsi14": 55.0})
+    assert result is not None
+    assert client.messages.calls == 2
+
+
+def test_request_prediction_returns_none_when_api_call_always_raises():
+    client = _FakeClient([RuntimeError("rate limited"), RuntimeError("timeout")])
     result = request_prediction(client, "TCS.NS", 1450.0, 42.5, {"rsi14": 55.0})
     assert result is None
     assert client.messages.calls == 2
