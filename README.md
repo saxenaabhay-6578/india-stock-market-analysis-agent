@@ -194,9 +194,10 @@ cached OHLCV history for a symbol:
 - **SMA** — 5, 10, 20, and 50-period simple moving averages (`sma5`, `sma10`,
   `sma20`, `sma50`); `sma50` is `None` whenever there are fewer than 50 bars
   of history (no fabricated value).
-- **RSI(14)** (`rsi14`) — Wilder-style average gain/loss ratio; pinned to 100
-  when average loss is 0, and 50 when both average gain and loss are 0 (flat
-  series), so it never divides by zero.
+- **RSI(14)** (`rsi14`) — a simple-moving-average-based RSI variant (uses a
+  plain rolling `.mean()` for average gain/loss, not Wilder's recursive
+  smoothing); pinned to 100 when average loss is 0, and 50 when both average
+  gain and loss are 0 (flat series), so it never divides by zero.
 - **MACD** (`macd`, `macd_signal`, `macd_histogram`) — 12/26 EMA difference
   and its 9-period EMA signal line.
 - **Bollinger Bands** (`bb_upper`, `bb_mid`, `bb_lower`) — 20-period SMA ± 2
@@ -287,10 +288,15 @@ partial storage) and the run continues with the rest of the universe.
 
 ## 9. Storage schema
 
-`src/storage/db.py` is the **only** module in the codebase that writes SQL —
-every other module builds plain dicts/tuples and calls into `db` to persist
-them. All four tables are append-only in normal operation; the application
-never issues `UPDATE` or `DELETE` against them.
+`src/storage/db.py` is the **only** module that writes to SQLite (`INSERT`)
+— every other module that needs to persist data builds plain dicts/tuples
+and calls into `db` to do so. `src/accuracy/scorer.py` and
+`src/reporting/excel_report.py` issue their own read-only `SELECT` queries
+directly against the connection for evaluation lookups and report
+projections, respectively — this is an approved, deliberate design choice
+(see the plan's module-responsibility table), not an inconsistency. All four
+tables are append-only in normal operation; the application never issues
+`UPDATE` or `DELETE` against them.
 
 - **`universe_snapshots`** — one row per symbol per run date: `id,
   snapshot_date, symbol, index_weight, rank, source, created_at`. Preserves
@@ -316,8 +322,11 @@ never issues `UPDATE` or `DELETE` against them.
 
 ## 10. Accuracy methodology
 
-`src/accuracy/scorer.py::run_accuracy_evaluation()` runs at the start of each
-pipeline run, before generating new predictions. It finds every prediction
+`src/accuracy/scorer.py::run_accuracy_evaluation()` runs after new
+predictions have been generated for the day (the full per-symbol
+prediction-generation loop in `run_daily.run_pipeline()` — fetch data,
+compute indicators, call Claude, store predictions — completes first), and
+immediately before the Excel report is generated. It finds every prediction
 whose `target_evaluation_date` has occurred and that has no matching row in
 `accuracy_evaluations` yet (`find_predictions_due_for_evaluation`). For each,
 `evaluate_prediction()` pulls the cached `price_bars` window for that symbol
@@ -382,8 +391,8 @@ sheets:
    `News-Sentiment` because `/` is not a legal character in an Excel sheet
    name. It stays empty in Phase 1 — no sentiment data is invented.
 8. **Configuration** — universe methodology, indicator/score formula version,
-   prompt version, data provider name, generation timestamp, and the phase
-   label (`Phase 1`).
+   prompt version, data provider name, generation timestamp, the phase label
+   (`Phase 1`), and the run date.
 
 ## 12. Extending each provider interface
 
