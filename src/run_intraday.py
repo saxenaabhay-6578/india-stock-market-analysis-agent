@@ -35,6 +35,20 @@ MARKET_OPEN_TIME = time(9, 15)
 # rather than hand Claude NaN-poisoned indicators.
 MIN_BARS_FOR_INDICATORS = 20
 
+PREDICTION_CHECKPOINTS = ["09:15", "10:15", "11:15", "12:15", "13:15", "14:15"]
+
+
+def find_missed_checkpoints(conn, checkpoint: datetime) -> list[str]:
+    today = checkpoint.date().isoformat()
+    current_hhmm = checkpoint.strftime("%H:%M")
+    rows = conn.execute(
+        "SELECT DISTINCT substr(prediction_timestamp, 12, 5) AS hhmm FROM intraday_predictions "
+        "WHERE date(prediction_timestamp) = ?",
+        (today,),
+    ).fetchall()
+    seen = {row["hhmm"] for row in rows}
+    return [cp for cp in PREDICTION_CHECKPOINTS if cp < current_hhmm and cp not in seen]
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="India stock market analysis agent - intraday hourly run")
@@ -49,6 +63,11 @@ def run_intraday_pipeline(
 ) -> dict:
     logger = logging.getLogger("run_intraday.pipeline")
     next_checkpoint_time = NEXT_CHECKPOINT.get(checkpoint.time())
+
+    missed = find_missed_checkpoints(conn, checkpoint)
+    if missed:
+        logger.warning("Missed intraday checkpoints today (no prediction generated, not backfilled): %s", missed)
+
     start = checkpoint - timedelta(days=INTRADAY_LOOKBACK_DAYS)
 
     made = 0

@@ -259,3 +259,44 @@ def test_symbol_with_nan_volume_bar_is_skipped_without_crashing_the_run(tmp_path
         "SELECT COUNT(*) FROM intraday_predictions WHERE symbol = 'RELIANCE.NS'"
     ).fetchone()[0] == 1
     conn.close()
+
+
+from src.run_intraday import find_missed_checkpoints
+
+
+def test_find_missed_checkpoints_empty_on_first_run_of_the_day(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    checkpoint = datetime(2026, 9, 15, 9, 15, tzinfo=IST)
+    assert find_missed_checkpoints(conn, checkpoint) == []
+    conn.close()
+
+
+def test_find_missed_checkpoints_detects_a_gap(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    provider = _FakeProvider(_hourly_frame(datetime(2026, 9, 15, 9, 15, tzinfo=IST)))
+    client = _FakeClient()
+
+    # simulate a successful 09:15 run, then jump straight to 12:15 (10:15 and 11:15 were missed)
+    run_intraday_pipeline(["RELIANCE.NS"], datetime(2026, 9, 15, 9, 15, tzinfo=IST), conn, provider, client, output_dir=tmp_path / "reports")
+
+    missed = find_missed_checkpoints(conn, datetime(2026, 9, 15, 12, 15, tzinfo=IST))
+    assert missed == ["10:15", "11:15"]
+    conn.close()
+
+
+def test_recovery_run_never_fabricates_predictions_for_missed_checkpoints(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    checkpoint_0915 = datetime(2026, 9, 15, 9, 15, tzinfo=IST)
+    checkpoint_1215 = datetime(2026, 9, 15, 12, 15, tzinfo=IST)
+    provider = _FakeProvider(_hourly_frame(checkpoint_1215))
+    client = _FakeClient()
+
+    run_intraday_pipeline(["RELIANCE.NS"], checkpoint_0915, conn, provider, client, output_dir=tmp_path / "reports")
+    run_intraday_pipeline(["RELIANCE.NS"], checkpoint_1215, conn, provider, client, output_dir=tmp_path / "reports")
+
+    recorded_checkpoints = {
+        row["prediction_timestamp"][11:16]
+        for row in conn.execute("SELECT prediction_timestamp FROM intraday_predictions WHERE symbol = 'RELIANCE.NS'")
+    }
+    assert recorded_checkpoints == {"09:15", "12:15"}  # never 10:15 or 11:15
+    conn.close()
