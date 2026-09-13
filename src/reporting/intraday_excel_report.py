@@ -25,7 +25,8 @@ def _fetch_open_prices(conn: sqlite3.Connection, symbols: list[str], run_date: d
     for symbol in symbols:
         row = conn.execute(
             "SELECT raw_current_price FROM intraday_predictions "
-            "WHERE symbol = ? AND date(prediction_timestamp) = ? ORDER BY prediction_timestamp LIMIT 1",
+            "WHERE symbol = ? AND date(prediction_timestamp) = ? "
+            "AND substr(prediction_timestamp, 12, 5) = '09:15' LIMIT 1",
             (symbol, run_date.isoformat()),
         ).fetchone()
         if row:
@@ -44,7 +45,7 @@ def generate_intraday_report(
     rows = _fetch_today_predictions(conn, run_date)
     by_symbol: dict[str, dict[str, sqlite3.Row]] = {}
     for row in rows:
-        checkpoint = row["prediction_timestamp"][11:16]
+        checkpoint = row["evaluation_timestamp"][11:16]
         by_symbol.setdefault(row["symbol"], {})[checkpoint] = row
 
     open_prices = _fetch_open_prices(conn, symbols, run_date)
