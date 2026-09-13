@@ -161,11 +161,13 @@ def test_duplicate_checkpoint_run_does_not_create_a_second_prediction_row(tmp_pa
     client = _FakeClient()
 
     run_intraday_pipeline(["RELIANCE.NS"], checkpoint, conn, provider, client, output_dir=tmp_path / "reports")
+    client.messages.calls = 0  # isolate the assertion below to calls made during the second run
     result = run_intraday_pipeline(["RELIANCE.NS"], checkpoint, conn, provider, client, output_dir=tmp_path / "reports")
 
     count = conn.execute("SELECT COUNT(*) FROM intraday_predictions").fetchone()[0]
     assert count == 1
     assert result["made"] == 0  # the duplicate insert was ignored, not counted as a new prediction
+    assert client.messages.calls == 0  # Claude was never called on the rerun - caught by the pre-check
     conn.close()
 
 
@@ -205,6 +207,53 @@ def test_symbol_with_insufficient_bar_history_is_skipped_without_stopping_others
     assert client.messages.calls == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM intraday_predictions WHERE symbol = 'THINSYM.NS'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM intraday_predictions WHERE symbol = 'RELIANCE.NS'"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+class _NaNVolumeProvider:
+    """Returns a valid hourly history for most symbols, but injects a NaN
+    volume into the most recent bar for symbols listed in nan_volume_symbols
+    -- reproducing yfinance's known behavior of occasionally returning NaN
+    volume for the most recent/incomplete intraday bar."""
+
+    def __init__(self, good_frame, nan_volume_symbols):
+        self._good_frame = good_frame
+        self._nan_volume_symbols = nan_volume_symbols
+
+    def get_intraday_history(self, symbol, start, end, interval):
+        if symbol in self._nan_volume_symbols:
+            frame = self._good_frame.copy()
+            frame.loc[frame.index[-1], "volume"] = float("nan")
+            return frame
+        return self._good_frame
+
+    def get_latest_intraday_price(self, symbol, as_of):
+        return (as_of, 1450.0)
+
+
+def test_symbol_with_nan_volume_bar_is_skipped_without_crashing_the_run(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    checkpoint = datetime(2026, 9, 15, 10, 15, tzinfo=IST)
+    provider = _NaNVolumeProvider(_hourly_frame(checkpoint), nan_volume_symbols={"BADVOL.NS"})
+    client = _FakeClient()
+
+    # int(NaN) raises ValueError deep inside the per-symbol body (building the
+    # cached price-bar rows / bar_snapshot). Per-symbol failure isolation must
+    # hold for this unexpected exception too, not just the two anticipated
+    # None/.empty data-missing cases -- so BADVOL.NS is skipped, not a crash
+    # that kills the run for RELIANCE.NS as well.
+    result = run_intraday_pipeline(
+        ["BADVOL.NS", "RELIANCE.NS"], checkpoint, conn, provider, client, output_dir=tmp_path / "reports",
+    )
+
+    assert result["skipped"] >= 1
+    assert result["made"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM intraday_predictions WHERE symbol = 'BADVOL.NS'"
     ).fetchone()[0] == 0
     assert conn.execute(
         "SELECT COUNT(*) FROM intraday_predictions WHERE symbol = 'RELIANCE.NS'"

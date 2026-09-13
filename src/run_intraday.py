@@ -54,79 +54,104 @@ def run_intraday_pipeline(
     made = 0
     skipped = 0
     for symbol in symbols:
-        if checkpoint.time() == MARKET_OPEN_TIME:
-            latest = provider.get_latest_intraday_price(symbol, checkpoint)
-            if latest is None:
-                logger.warning("Skipping %s: no market-open tick available", symbol)
-                skipped += 1
-                continue
-            _, raw_current_price = latest
-            bar_snapshot = {"open": raw_current_price, "high": raw_current_price,
-                             "low": raw_current_price, "close": raw_current_price, "volume": None}
-        else:
-            hourly = provider.get_intraday_history(symbol, start=start, end=checkpoint, interval=INTRADAY_INTERVAL)
-            if hourly is None or hourly.empty:
-                logger.warning("Skipping %s: no intraday market data", symbol)
-                skipped += 1
-                continue
+        try:
+            history_for_indicators = None
+            if checkpoint.time() == MARKET_OPEN_TIME:
+                latest = provider.get_latest_intraday_price(symbol, checkpoint)
+                if latest is None:
+                    logger.warning("Skipping %s: no market-open tick available", symbol)
+                    skipped += 1
+                    continue
+                _, raw_current_price = latest
+                bar_snapshot = {"open": raw_current_price, "high": raw_current_price,
+                                 "low": raw_current_price, "close": raw_current_price, "volume": None}
+            else:
+                hourly = provider.get_intraday_history(symbol, start=start, end=checkpoint, interval=INTRADAY_INTERVAL)
+                if hourly is None or hourly.empty:
+                    logger.warning("Skipping %s: no intraday market data", symbol)
+                    skipped += 1
+                    continue
+                if not dry_run:
+                    rows = [
+                        {
+                            "symbol": symbol, "timestamp": r["timestamp"].isoformat(), "interval": INTRADAY_INTERVAL,
+                            "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
+                            "close": float(r["close"]), "volume": int(r["volume"]), "source": "yfinance",
+                            "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        for _, r in hourly.iterrows()
+                    ]
+                    db.insert_intraday_price_bar_rows(conn, rows)
+                last_bar = hourly.iloc[-1]
+                raw_current_price = float(last_bar["close"])
+                bar_snapshot = {
+                    "open": float(last_bar["open"]), "high": float(last_bar["high"]),
+                    "low": float(last_bar["low"]), "close": float(last_bar["close"]),
+                    "volume": int(last_bar["volume"]),
+                }
+                # Reuse the frame just fetched for bar-caching as the indicator input
+                # instead of re-fetching identical data from the provider a second time.
+                history_for_indicators = hourly
+
+            if next_checkpoint_time is None:
+                continue  # 15:15: evaluation-only, never generate a new prediction
+
             if not dry_run:
-                rows = [
-                    {
-                        "symbol": symbol, "timestamp": r["timestamp"].isoformat(), "interval": INTRADAY_INTERVAL,
-                        "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
-                        "close": float(r["close"]), "volume": int(r["volume"]), "source": "yfinance",
-                        "fetched_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    for _, r in hourly.iterrows()
-                ]
-                db.insert_intraday_price_bar_rows(conn, rows)
-            last_bar = hourly.iloc[-1]
-            raw_current_price = float(last_bar["close"])
-            bar_snapshot = {
-                "open": float(last_bar["open"]), "high": float(last_bar["high"]),
-                "low": float(last_bar["low"]), "close": float(last_bar["close"]),
-                "volume": int(last_bar["volume"]),
-            }
+                existing = conn.execute(
+                    "SELECT 1 FROM intraday_predictions WHERE symbol = ? AND prediction_timestamp = ? "
+                    "AND prediction_type = 'next_hour'",
+                    (symbol, checkpoint.isoformat()),
+                ).fetchone()
+                if existing is not None:
+                    logger.info(
+                        "Prediction for %s at %s already exists, skipping Claude call",
+                        symbol, checkpoint.isoformat(),
+                    )
+                    continue
 
-        if next_checkpoint_time is None:
-            continue  # 15:15: evaluation-only, never generate a new prediction
-
-        history = provider.get_intraday_history(symbol, start=start, end=checkpoint, interval=INTRADAY_INTERVAL)
-        if history is None or history.empty:
-            logger.warning("Skipping %s: no indicator history", symbol)
-            skipped += 1
-            continue
-        filtered = select_bars_up_to_checkpoint(history, checkpoint)
-        if filtered.empty:
-            logger.warning("Skipping %s: no bars available before checkpoint", symbol)
-            skipped += 1
-            continue
-        if len(filtered) < MIN_BARS_FOR_INDICATORS:
-            logger.warning(
-                "Skipping %s: insufficient bar history for reliable indicators (%d bars, need >= %d)",
-                symbol, len(filtered), MIN_BARS_FOR_INDICATORS,
-            )
-            skipped += 1
-            continue
-        indicators = compute_intraday_indicators(filtered)
-
-        prediction = request_prediction(client, symbol, raw_current_price, indicators["technical_score"], indicators)
-        if prediction is None:
-            skipped += 1
-            continue
-
-        if not dry_run:
-            evaluation_ts = datetime.combine(checkpoint.date(), next_checkpoint_time, tzinfo=checkpoint.tzinfo)
-            row = build_prediction_row(
-                symbol, checkpoint, evaluation_ts, prediction, raw_current_price, bar_snapshot,
-                indicators["technical_score"], indicators, "yfinance", INTRADAY_INTERVAL,
-            )
-            inserted = insert_prediction(conn, row)
-            if inserted == 0:
-                logger.info("Prediction for %s at %s already exists, treating as duplicate no-op", symbol, checkpoint.isoformat())
+            if history_for_indicators is None:
+                history_for_indicators = provider.get_intraday_history(
+                    symbol, start=start, end=checkpoint, interval=INTRADAY_INTERVAL,
+                )
+            if history_for_indicators is None or history_for_indicators.empty:
+                logger.warning("Skipping %s: no indicator history", symbol)
+                skipped += 1
                 continue
-        made += 1
-        logger.info("Intraday prediction generated for %s at %s (dry_run=%s)", symbol, checkpoint.isoformat(), dry_run)
+            filtered = select_bars_up_to_checkpoint(history_for_indicators, checkpoint)
+            if filtered.empty:
+                logger.warning("Skipping %s: no bars available before checkpoint", symbol)
+                skipped += 1
+                continue
+            if len(filtered) < MIN_BARS_FOR_INDICATORS:
+                logger.warning(
+                    "Skipping %s: insufficient bar history for reliable indicators (%d bars, need >= %d)",
+                    symbol, len(filtered), MIN_BARS_FOR_INDICATORS,
+                )
+                skipped += 1
+                continue
+            indicators = compute_intraday_indicators(filtered)
+
+            prediction = request_prediction(client, symbol, raw_current_price, indicators["technical_score"], indicators)
+            if prediction is None:
+                skipped += 1
+                continue
+
+            if not dry_run:
+                evaluation_ts = datetime.combine(checkpoint.date(), next_checkpoint_time, tzinfo=checkpoint.tzinfo)
+                row = build_prediction_row(
+                    symbol, checkpoint, evaluation_ts, prediction, raw_current_price, bar_snapshot,
+                    indicators["technical_score"], indicators, "yfinance", INTRADAY_INTERVAL,
+                )
+                inserted = insert_prediction(conn, row)
+                if inserted == 0:
+                    logger.info("Prediction for %s at %s already exists, treating as duplicate no-op", symbol, checkpoint.isoformat())
+                    continue
+            made += 1
+            logger.info("Intraday prediction generated for %s at %s (dry_run=%s)", symbol, checkpoint.isoformat(), dry_run)
+        except Exception as exc:
+            logger.error("Unexpected error processing %s: %s", symbol, exc)
+            skipped += 1
+            continue
 
     result = {"made": made, "skipped": skipped, "evaluated": 0, "report_path": None}
     if not dry_run:
