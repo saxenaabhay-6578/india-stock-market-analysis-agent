@@ -73,11 +73,23 @@ Excel report generator (reads only from SQLite) ──► reports/YYYY-MM-DD.xls
 are stubs that return an explicit "Not available in Phase 1" value and are
 never invented or estimated.
 
+**Module layout:** implemented as nested packages under `src/` —
+`src/providers/` (all three provider interfaces + Phase 1 implementations),
+`src/universe/` (weights, holidays, calendar, top-N selection),
+`src/analysis/` (indicators, technical score), `src/prediction/` (prompt,
+Claude call, JSON validation), `src/storage/` (SQLite schema and all
+reads/writes), `src/accuracy/` (evaluator), `src/reporting/` (Excel
+generator), plus a top-level, non-secret `config/` package for paths and
+tunables (DB/report/log locations, retry counts, model id). Secrets never
+live in `config/` — only in a git-ignored `.env`. See the Phase 1
+implementation plan for the exact file-by-file layout and each module's
+responsibility.
+
 ## 3. Universe selection
 
 - A static, version-controlled table of NIFTY-50 constituents and their
-  published index weights (`universe/nifty50_weights.py`), with a comment
-  documenting the source and date it was last refreshed.
+  published index weights (`src/universe/nifty50_weights.py`), with a
+  comment documenting the source and date it was last refreshed.
 - Each run takes the top 20 by weight. This is deterministic and
   reproducible for any given weights snapshot.
 - Every run records the exact 20 symbols used that day into
@@ -95,7 +107,7 @@ prediction must never be evaluated by adding 5 calendar days.
   `add_trading_days(date, n)`, `trading_days_between(start, end)`.
 - Phase 1 implementation, `NseStaticHolidayCalendar`: weekday check (Mon–Fri)
   minus a documented, manually-maintained static list of NSE trading
-  holidays per year (`universe/nse_holidays.py`), with a README note to
+  holidays per year (`src/universe/nse_holidays.py`), with a README note to
   update it each January. If a maintained free holiday library/API is found
   during implementation that is more reliable, it can replace this
   implementation without changing any caller.
