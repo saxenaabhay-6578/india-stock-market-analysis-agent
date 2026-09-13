@@ -41,7 +41,7 @@ def _valid_payload(current_price):
 
 class _FakeMessage:
     def __init__(self, text):
-        self.content = [type("Block", (), {"text": text})()]
+        self.content = [type("Block", (), {"type": "text", "text": text})()]
 
 
 class _FakeMessages:

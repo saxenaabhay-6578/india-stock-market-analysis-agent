@@ -109,9 +109,24 @@ def test_validate_response_rejects_missing_top_level_key_entirely():
         validate_response(json.dumps(payload), expected_current_price=1450.0)
 
 
-class _FakeMessage:
+class _FakeThinkingBlock:
+    def __init__(self):
+        self.type = "thinking"
+        # deliberately no .text attribute, to match the real SDK's ThinkingBlock shape
+
+
+class _FakeTextBlock:
     def __init__(self, text):
-        self.content = [type("Block", (), {"text": text})()]
+        self.type = "text"
+        self.text = text
+
+
+class _FakeMessage:
+    def __init__(self, text=None, content=None):
+        if content is not None:
+            self.content = content
+        else:
+            self.content = [_FakeTextBlock(text)]
 
 
 class _FakeMessages:
@@ -124,7 +139,9 @@ class _FakeMessages:
         self.calls += 1
         if isinstance(item, Exception):
             raise item
-        return _FakeMessage(item)
+        if isinstance(item, list):
+            return _FakeMessage(content=item)
+        return _FakeMessage(text=item)
 
 
 class _FakeClient:
@@ -158,6 +175,15 @@ def test_request_prediction_returns_none_when_api_call_always_raises():
     result = request_prediction(client, "TCS.NS", 1450.0, 42.5, {"rsi14": 55.0})
     assert result is None
     assert client.messages.calls == 2
+
+
+def test_request_prediction_extracts_text_block_when_thinking_block_precedes_it():
+    content = [_FakeThinkingBlock(), _FakeTextBlock(json.dumps(_valid_payload()))]
+    client = _FakeClient([content])
+    result = request_prediction(client, "TCS.NS", 1450.0, 42.5, {"rsi14": 55.0})
+    assert result is not None
+    assert result["horizons"]["1d"]["direction"] == "BULLISH"
+    assert client.messages.calls == 1
 
 
 def test_insert_predictions_writes_one_row_per_horizon_and_never_overwrites(tmp_path):

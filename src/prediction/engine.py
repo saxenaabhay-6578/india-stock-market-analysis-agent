@@ -108,7 +108,13 @@ def request_prediction(client, symbol: str, current_price: float, technical_scor
                 max_tokens=2000,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw_text = response.content[0].text
+            # The real Anthropic SDK can return non-text content blocks (e.g. extended-thinking
+            # ThinkingBlock) before the actual text response, so find the first text block rather
+            # than assuming content[0] is text.
+            text_block = next((block for block in response.content if getattr(block, "type", None) == "text"), None)
+            if text_block is None:
+                raise ValueError("no text block found in Claude response content")
+            raw_text = text_block.text
         except Exception as exc:
             logger.warning("Claude API call failed for %s (attempt %d): %s", symbol, attempt + 1, exc)
             continue
