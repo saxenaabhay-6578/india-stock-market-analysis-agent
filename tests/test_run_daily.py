@@ -71,6 +71,8 @@ def test_dry_run_writes_nothing_to_db_or_reports(tmp_path):
     assert result["made"] == 1
     assert result["report_path"] is None
     assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM price_bars").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM universe_snapshots").fetchone()[0] == 0
     assert not (tmp_path / "reports").exists()
     conn.close()
 
@@ -108,6 +110,34 @@ def test_symbol_with_no_market_data_is_skipped_without_stopping_others(tmp_path)
         ["BADSYM.NS", "TCS.NS"], date(2026, 9, 14), dry_run=False, conn=conn,
         provider=_PartialProvider(), client=_FakeClient(), calendar=NseStaticHolidayCalendar(),
         output_dir=tmp_path / "reports",
+    )
+
+    assert result["made"] == 1
+    assert result["skipped"] == 1
+    conn.close()
+
+
+def test_symbol_with_claude_validation_failure_is_skipped_without_stopping_others(tmp_path):
+    class _MixedValidityMessages:
+        def create(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            stock_line = [line for line in prompt.splitlines() if line.startswith("Stock:")][0]
+            symbol = stock_line.split(":")[1].strip()
+            if symbol == "BADPRED.NS":
+                return _FakeMessage("not valid json")
+            price_line = [line for line in prompt.splitlines() if line.startswith("Current price:")][0]
+            current_price = float(price_line.split(":")[1].strip())
+            return _FakeMessage(json.dumps(_valid_payload(current_price)))
+
+    class _MixedValidityClient:
+        def __init__(self):
+            self.messages = _MixedValidityMessages()
+
+    conn = get_connection(tmp_path / "test.db")
+    result = run_pipeline(
+        ["BADPRED.NS", "TCS.NS"], date(2026, 9, 14), dry_run=False, conn=conn,
+        provider=_FakeProvider(_fake_history()), client=_MixedValidityClient(),
+        calendar=NseStaticHolidayCalendar(), output_dir=tmp_path / "reports",
     )
 
     assert result["made"] == 1
