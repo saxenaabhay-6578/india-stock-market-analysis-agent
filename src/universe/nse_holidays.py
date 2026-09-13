@@ -11,7 +11,7 @@ NSE_HOLIDAYS = {
         "2026-04-14",  # Dr. Ambedkar Jayanti
         "2026-05-01",  # Maharashtra Day
         "2026-08-15",  # Independence Day
-        "2026-08-26",  # Ganesh Chaturthi
+        "2026-09-14",  # Ganesh Chaturthi
         "2026-10-02",  # Gandhi Jayanti
         "2026-10-21",  # Diwali Laxmi Pujan
         "2026-11-24",  # Guru Nanak Jayanti

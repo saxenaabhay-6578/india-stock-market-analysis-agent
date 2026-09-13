@@ -5,7 +5,7 @@ from src.universe.trading_calendar import NseStaticHolidayCalendar
 
 def test_weekday_is_trading_day():
     cal = NseStaticHolidayCalendar()
-    assert cal.is_trading_day(date(2026, 9, 14))  # Monday
+    assert cal.is_trading_day(date(2026, 9, 7))  # Monday
 
 
 def test_weekend_is_not_trading_day():
@@ -21,8 +21,8 @@ def test_holiday_is_not_trading_day():
 
 def test_add_trading_days_skips_weekend():
     cal = NseStaticHolidayCalendar()
-    friday = date(2026, 9, 11)
-    assert cal.add_trading_days(friday, 1) == date(2026, 9, 14)  # Monday
+    friday = date(2026, 9, 4)
+    assert cal.add_trading_days(friday, 1) == date(2026, 9, 7)  # Monday
 
 
 def test_add_trading_days_skips_holiday():
@@ -34,6 +34,6 @@ def test_add_trading_days_skips_holiday():
 
 def test_trading_days_between_counts_only_trading_days():
     cal = NseStaticHolidayCalendar()
-    start = date(2026, 9, 11)  # Friday
-    end = date(2026, 9, 15)  # Tuesday
+    start = date(2026, 9, 4)  # Friday
+    end = date(2026, 9, 8)  # Tuesday
     assert cal.trading_days_between(start, end) == 2  # Mon + Tue
