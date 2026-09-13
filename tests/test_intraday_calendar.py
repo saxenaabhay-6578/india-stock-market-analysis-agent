@@ -59,3 +59,10 @@ def test_current_checkpoint_none_well_after_market_close():
     cal = IntradayMarketCalendar(NseStaticHolidayCalendar(), buffer_minutes=10)
     now = datetime(2026, 9, 15, 18, 0, tzinfo=IST)  # 3+ hours after the last checkpoint
     assert cal.current_checkpoint(now) is None
+
+
+def test_current_checkpoint_resolves_to_the_later_of_two_simultaneously_eligible_checkpoints():
+    cal = IntradayMarketCalendar(NseStaticHolidayCalendar(), buffer_minutes=10)
+    now = datetime(2026, 9, 15, 11, 25, tzinfo=IST)  # Tuesday; 10:15's window closes exactly as 11:15's opens
+    result = cal.current_checkpoint(now)
+    assert result == datetime(2026, 9, 15, 11, 15, tzinfo=IST)

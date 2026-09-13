@@ -31,6 +31,7 @@ class IntradayMarketCalendar:
         self._buffer = timedelta(minutes=buffer_minutes)
 
     def current_checkpoint(self, now: datetime) -> datetime | None:
+        """Resolve the latest eligible checkpoint at or before now. Parameter now must be timezone-aware (e.g., Asia/Kolkata for NSE data)."""
         if not self._trading_calendar.is_trading_day(now.date()):
             return None
         eligible = []
