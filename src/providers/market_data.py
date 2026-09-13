@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import yfinance as yf
@@ -19,6 +19,13 @@ _COLUMN_RENAME = {
     "Close": "close", "Adj Close": "adj_close", "Volume": "volume",
 }
 
+INTRADAY_REQUIRED_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+
+_INTRADAY_COLUMN_RENAME = {
+    "Datetime": "timestamp", "Date": "timestamp", "Open": "open", "High": "high",
+    "Low": "low", "Close": "close", "Volume": "volume",
+}
+
 
 class MarketDataProvider(ABC):
     @abstractmethod
@@ -26,6 +33,12 @@ class MarketDataProvider(ABC):
 
     @abstractmethod
     def get_latest_close(self, symbol: str) -> tuple[date, float] | None: ...
+
+    @abstractmethod
+    def get_intraday_history(self, symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame | None: ...
+
+    @abstractmethod
+    def get_latest_intraday_price(self, symbol: str, as_of: datetime) -> tuple[datetime, float] | None: ...
 
 
 class YFinanceProvider(MarketDataProvider):
@@ -62,3 +75,35 @@ class YFinanceProvider(MarketDataProvider):
             return None
         last_row = history.iloc[-1]
         return last_row["date"], float(last_row["close"])
+
+    def get_intraday_history(self, symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame | None:
+        for attempt in range(self._max_retries + 1):
+            try:
+                raw = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=False)
+                if raw is None or raw.empty:
+                    logger.warning("No intraday data returned for %s", symbol)
+                    return None
+                df = raw.reset_index().rename(columns=_INTRADAY_COLUMN_RENAME)
+                missing = set(INTRADAY_REQUIRED_COLUMNS) - set(df.columns)
+                if missing:
+                    logger.warning("Symbol %s missing intraday columns %s, skipping", symbol, missing)
+                    return None
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                return df[INTRADAY_REQUIRED_COLUMNS]
+            except Exception as exc:
+                logger.warning("Intraday attempt %d failed for %s: %s", attempt + 1, symbol, exc)
+                if attempt < self._max_retries:
+                    time.sleep(self._backoff_seconds * (attempt + 1))
+        logger.error("All intraday retries exhausted for %s, skipping", symbol)
+        return None
+
+    def get_latest_intraday_price(self, symbol: str, as_of: datetime) -> tuple[datetime, float] | None:
+        start = as_of.replace(hour=0, minute=0, second=0, microsecond=0)
+        history = self.get_intraday_history(symbol, start=start, end=as_of + timedelta(minutes=1), interval="1m")
+        if history is None or history.empty:
+            return None
+        filtered = history[history["timestamp"] <= as_of]
+        if filtered.empty:
+            return None
+        last_row = filtered.iloc[-1]
+        return last_row["timestamp"].to_pydatetime(), float(last_row["close"])
