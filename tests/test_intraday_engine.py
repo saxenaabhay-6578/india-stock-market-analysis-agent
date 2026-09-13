@@ -49,6 +49,23 @@ def test_validate_response_rejects_each_invalid_shape(mutate, expected_error_sub
         validate_response(raw, expected_current_price=1450.0)
 
 
+def test_validate_response_strips_markdown_json_fence():
+    raw = "```json\n" + json.dumps(_valid_payload()) + "\n```"
+    result = validate_response(raw, expected_current_price=1450.0)
+    assert result["direction"] == "BULLISH"
+
+
+def test_validate_response_strips_markdown_fence_without_json_language_tag():
+    raw = "```\n" + json.dumps(_valid_payload()) + "\n```"
+    result = validate_response(raw, expected_current_price=1450.0)
+    assert result["direction"] == "BULLISH"
+
+
+def test_validate_response_rejects_invalid_json():
+    with pytest.raises(IntradayPredictionValidationError, match="invalid JSON"):
+        validate_response("not json at all", expected_current_price=1450.0)
+
+
 class _FakeTextBlock:
     def __init__(self, text):
         self.type = "text"

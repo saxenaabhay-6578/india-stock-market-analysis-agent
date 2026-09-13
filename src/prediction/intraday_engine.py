@@ -21,6 +21,17 @@ class IntradayPredictionValidationError(Exception):
     pass
 
 
+def _strip_markdown_code_fence(raw_text: str) -> str:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        # Drop the opening fence line (``` or ```json)
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    return text
+
+
 def build_prompt(symbol: str, current_price: float, technical_score: float, indicators: dict[str, Any]) -> str:
     indicators_summary = json.dumps(indicators, indent=2, default=str)
     return f"""You are an intraday technical analysis assistant for Indian equity markets.
@@ -47,7 +58,7 @@ Respond with STRICT JSON only, no text outside the JSON, in exactly this shape:
 
 def validate_response(raw_text: str, expected_current_price: float) -> dict[str, Any]:
     try:
-        data = json.loads(raw_text)
+        data = json.loads(_strip_markdown_code_fence(raw_text))
     except json.JSONDecodeError as exc:
         raise IntradayPredictionValidationError(f"invalid JSON: {exc}") from exc
 
