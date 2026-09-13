@@ -77,6 +77,7 @@ class YFinanceProvider(MarketDataProvider):
         return last_row["date"], float(last_row["close"])
 
     def get_intraday_history(self, symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame | None:
+        """Fetch intraday OHLCV data. Parameters start/end must be timezone-aware (e.g., Asia/Kolkata for NSE data)."""
         for attempt in range(self._max_retries + 1):
             try:
                 raw = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=False)
@@ -98,6 +99,7 @@ class YFinanceProvider(MarketDataProvider):
         return None
 
     def get_latest_intraday_price(self, symbol: str, as_of: datetime) -> tuple[datetime, float] | None:
+        """Get the latest intraday price at or before as_of. Parameter as_of must be timezone-aware (e.g., Asia/Kolkata for NSE data)."""
         start = as_of.replace(hour=0, minute=0, second=0, microsecond=0)
         history = self.get_intraday_history(symbol, start=start, end=as_of + timedelta(minutes=1), interval="1m")
         if history is None or history.empty:

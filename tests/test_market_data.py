@@ -152,3 +152,19 @@ def test_get_latest_intraday_price_returns_none_when_no_ticks_available(monkeypa
     provider = YFinanceProvider()
     result = provider.get_latest_intraday_price("RELIANCE.NS", datetime(2026, 9, 14, 9, 15))
     assert result is None
+
+
+def test_get_latest_intraday_price_raises_on_naive_as_of(monkeypatch):
+    idx = pd.date_range("2026-09-14 09:10", periods=10, freq="1min", tz="Asia/Kolkata")
+    idx.name = "Datetime"
+    frame = pd.DataFrame({
+        "Open": [100.0] * 10, "High": [100.0] * 10, "Low": [100.0] * 10,
+        "Close": [100.0 + i for i in range(10)], "Volume": [1000] * 10,
+    }, index=idx)
+    fake_ticker = FakeHistoryTicker(frame=frame)
+    monkeypatch.setattr("src.providers.market_data.yf.Ticker", lambda symbol: fake_ticker)
+
+    provider = YFinanceProvider()
+    naive_as_of = datetime(2026, 9, 14, 9, 15)  # No tzinfo
+    with pytest.raises(TypeError):
+        provider.get_latest_intraday_price("RELIANCE.NS", naive_as_of)
