@@ -464,3 +464,379 @@ pytest -v
 
 All unit tests mock `yfinance` and the Anthropic client — no live network or
 Claude calls are made during the test suite.
+
+## 15. Intraday System (Phase 2)
+
+### 15.1 Overview
+
+Phase 2 adds a second, independent prediction system: **hourly** predictions
+and accuracy tracking for the same fixed NIFTY-50 Top-20 universe (same
+`nifty50_weights.py`, same `TOP_N = 20`), running once per trading-day hour
+instead of once per day. It shares the same SQLite database file
+(`config.settings.DB_PATH`) and the same universe configuration as the daily
+system, but writes to entirely separate tables
+(`intraday_price_bars`, `intraday_predictions`,
+`intraday_accuracy_evaluations`) via its own CLI entrypoint
+(`src/run_intraday.py`). **The daily system (`src/run_daily.py` and every
+module described in sections 1–14 above) is completely untouched by Phase
+2** — no daily-path module was modified to build this, and nothing described
+below changes any daily behavior.
+
+### 15.2 How to run
+
+```bash
+python -m src.run_intraday
+# Resolves the current checkpoint (see 15.3) and, if one is due, fetches
+# hourly bars for the Top-20 universe, computes indicators, calls Claude
+# once per stock for the checkpoints that generate a prediction, stores
+# predictions, evaluates any predictions now due, and updates
+# reports/intraday/YYYY-MM-DD.xlsx.
+
+python -m src.run_intraday --symbols RELIANCE.NS,TCS.NS
+# Limits the universe to the given comma-separated symbols, same purpose as
+# the daily system's --symbols flag.
+
+python -m src.run_intraday --dry-run
+# Still calls Claude for real (request_prediction() is not gated by
+# --dry-run), but writes nothing to intraday_price_bars,
+# intraday_predictions, intraday_accuracy_evaluations, or the Excel report.
+```
+
+A manual invocation only does something if
+`IntradayMarketCalendar.current_checkpoint(now)` (`src/universe/intraday_calendar.py`)
+resolves to an actual checkpoint: `now` must fall on a trading day (per the
+existing `NseStaticHolidayCalendar`) **and** within the eligibility window of
+one of the seven daily checkpoints — from `checkpoint + 10 minutes` (the
+buffer, `INTRADAY_LAUNCHD_BUFFER_MINUTES`) up to one hour after that. Outside
+any such window (pre-market, post-market, lunchtime between windows, a
+weekend, a holiday), the run logs why and exits `0` without touching SQLite
+or the Excel report — same philosophy as `run_daily.py`.
+
+Within a due run, each of the 20 symbols is processed independently inside a
+`try/except`: a data-fetch failure, a Claude failure, or any other unexpected
+exception for one symbol is logged and counted in `skipped`, and the loop
+continues with the remaining symbols. Two additional guards, both added
+during implementation hardening:
+
+- **Minimum-bars guard** — after filtering bars to the no-look-ahead window
+  (15.3), a symbol is skipped if fewer than `MIN_BARS_FOR_INDICATORS = 20`
+  bars remain, since several indicators (`sma20`, Bollinger, volatility,
+  momentum) would otherwise silently compute against `NaN`-poisoned or
+  too-short windows.
+- **Duplicate-prediction pre-check** — before making a Claude call, the
+  pipeline checks whether a row already exists in `intraday_predictions` for
+  `(symbol, prediction_timestamp, prediction_type='next_hour')`; if so, it
+  skips straight past the Claude call (not just the insert), so a rerun for
+  an already-completed checkpoint burns zero extra Claude calls. The
+  `UNIQUE(symbol, prediction_timestamp, prediction_type)` constraint (via
+  `INSERT OR IGNORE`) remains as a second, storage-level safety net in case
+  a duplicate insert is attempted anyway.
+
+The pipeline also detects — but never backfills — missed checkpoints:
+`find_missed_checkpoints()` compares today's already-recorded prediction
+checkpoints against every prediction-generating checkpoint earlier than the
+current one, and logs any gaps (e.g. "Missed intraday checkpoints today (no
+prediction generated, not backfilled): ['10:15', '11:15']"). No fabricated
+prediction is ever created for a missed checkpoint; the run simply proceeds
+to generate (at most) one new prediction, for the current checkpoint only.
+
+### 15.3 Checkpoint schedule & timing model
+
+The checkpoint grid (`src/universe/intraday_calendar.py::CHECKPOINTS`) is
+fixed at seven times per trading day: **09:15, 10:15, 11:15, 12:15, 13:15,
+14:15, 15:15** IST. `NEXT_CHECKPOINT` maps each checkpoint to the one it
+predicts toward (`09:15 → 10:15`, ..., `14:15 → 15:15`), except
+`15:15 → None`.
+
+Two timestamps are recorded on every `intraday_predictions` row and are
+never conflated:
+
+- **`prediction_timestamp`** — the logical checkpoint (e.g.
+  `2026-09-14T10:15:00+05:30`). All data selection, evaluation matching, and
+  Excel column placement key off this value.
+- **`created_at`** — the actual wall-clock time `request_prediction()` ran
+  (e.g. whenever the process happened to execute). Diagnostic only.
+
+The ~15-minute delay inherent to the free `yfinance` intraday feed is
+accommodated by a fixed buffer: `IntradayMarketCalendar` only considers a
+checkpoint "current" starting `INTRADAY_LAUNCHD_BUFFER_MINUTES = 10` minutes
+after its nominal time (giving the delayed feed time to surface the
+just-closed bar), and it stays eligible for a further one-hour window after
+that (`ELIGIBILITY_WINDOW = timedelta(hours=1)` in
+`src/universe/intraday_calendar.py`) — this is also what makes missed-run
+recovery possible: a run that fires late still resolves to the correct
+checkpoint rather than none at all.
+
+**15:15 is evaluation-only.** Because `NEXT_CHECKPOINT[time(15, 15)]` is
+`None`, `run_intraday_pipeline()` branches on that (`if next_checkpoint_time
+is None: continue`) and never calls `request_prediction()` for that
+checkpoint — it only evaluates the 14:15 prediction against the 14:15→15:15
+bar. This is a structural branch, not a try/fail-gracefully pattern.
+
+**09:15 is a special case for the raw price only.** No `09:15`-labeled
+hourly bar exists yet at that instant (it would cover `09:15→10:15`), so
+`raw_current_price` at 09:15 is fetched via a separate provider call,
+`get_latest_intraday_price(symbol, checkpoint)` (the latest available tick),
+rather than read off the hourly bar series. Indicators are still computed
+from the same hourly bar history, filtered by the same
+`select_bars_up_to_checkpoint` rule (15.4) — which, since today's first bar
+doesn't exist yet, naturally resolves to all of the prior trading days'
+bars, with no special-case indicator code needed.
+
+### 15.4 Indicator periods
+
+`src/analysis/intraday_indicators.py::compute_intraday_indicators()` reuses
+the same indicator math as the daily system (`src/analysis/indicators.py`),
+computed on 60-minute bars instead of daily bars:
+
+| Indicator | Period (hours) | Notes |
+|---|---|---|
+| SMA | 5, 10, 20, 50 | `sma50` requires ≥50 bars (same `None`-if-insufficient pattern the caller must handle; the pipeline's min-bars guard requires only 20) |
+| EMA | 9, 21 | New for intraday — computed locally in this module (`series.ewm(span=..., adjust=False).mean()`), not present in the daily indicator set |
+| RSI | 14 | Same `rsi()` function as daily |
+| MACD | 12 / 26 / 9 | Same `macd()` defaults as daily |
+| Bollinger Bands | 20, ±2σ | Same `bollinger_bands()` defaults as daily |
+| Support/Resistance | 20-bar swing | Same `support_resistance(window=20)` |
+| Rolling volatility | 20-bar window | Same `rolling_volatility(window=20)` |
+| Momentum / ROC | 10-bar window | Same `momentum_roc(window=10)` |
+| Volume trend | 20-bar window | Same `volume_trend(window=20)` |
+
+`technical_score` (`src/analysis/technical_score.py::compute_technical_score`)
+is reused completely unchanged — it is a pure function over already-computed
+indicator values and has no notion of timeframe.
+
+**No-look-ahead rule:** `select_bars_up_to_checkpoint(bars, checkpoint)` is
+the single function permitted to filter the bars DataFrame, and its rule is
+exactly `timestamp < checkpoint` (a strict inequality). At the 09:15
+checkpoint this naturally returns only prior trading days' bars, since
+today's first hourly bar (09:15→10:15) does not exist yet — no special-case
+code is needed for market open.
+
+Cached lookback is `INTRADAY_LOOKBACK_DAYS = 20` (trading days) of hourly
+bars, fetched via `get_intraday_history(..., interval="60m")`.
+
+### 15.5 Prediction contract
+
+One Claude call per stock per prediction-generating checkpoint (six per day
+— never at 15:15). `src/prediction/intraday_engine.py::build_prompt()`
+sends only the symbol, current price, technical score, and computed hourly
+indicators (never raw bar history), and asks for a single-horizon
+prediction targeting the next hourly checkpoint:
+
+```json
+{
+  "direction": "BULLISH|BEARISH|NEUTRAL",
+  "current_price": number,
+  "predicted_price": number,
+  "expected_move_percent": number,
+  "confidence": number (0-100),
+  "reasoning": "string",
+  "key_risks": ["string", ...]
+}
+```
+
+`validate_response()` enforces, before anything is stored:
+
+- The response parses as JSON and is a dict.
+- All required fields (`direction`, `current_price`, `predicted_price`,
+  `expected_move_percent`, `confidence`, `reasoning`, `key_risks`) are
+  present.
+- `direction` is one of `BULLISH`/`BEARISH`/`NEUTRAL`.
+- `current_price`, `predicted_price`, and `expected_move_percent` are
+  numeric.
+- The echoed `current_price` matches the value actually sent, within a
+  tolerance of `max(1% of price, 0.5)` — same tolerance formula as the daily
+  engine; this is a sanity check only, never authoritative (see 15.6).
+- `confidence` is numeric and in `[0, 100]`.
+- `key_risks` is a non-empty list of strings.
+
+`request_prediction()` retries once on either an API-call exception or a
+validation failure; if the second attempt also fails, the symbol is skipped
+for that checkpoint entirely (logged, no partial storage) and the run
+continues with the rest of the universe. On success it also captures
+`response.usage.input_tokens`/`output_tokens` for storage (15.9).
+
+### 15.6 Storage schema
+
+`src/storage/db.py` remains the **only** module that writes to SQLite; three
+new `CREATE TABLE IF NOT EXISTS` statements were added to the same `SCHEMA`
+string used by the daily tables (idempotent — an existing database gains
+them on the next `get_connection()` call, no migration script needed). All
+three are append-only; the application never issues `UPDATE`/`DELETE`
+against them.
+
+- **`intraday_price_bars`** — cached hourly OHLCV, unique on `(symbol,
+  timestamp, interval)`: `id, symbol, timestamp, interval, open, high, low,
+  close, volume, source, fetched_at`. Written via
+  `insert_intraday_price_bar_rows()` (`INSERT OR IGNORE`).
+- **`intraday_predictions`** — one row per stock per prediction-generating
+  checkpoint, unique on `(symbol, prediction_timestamp, prediction_type)`:
+  `id, created_at, symbol, prediction_timestamp, evaluation_timestamp,
+  prediction_type, raw_current_price, open, high, low, close, volume,
+  direction, predicted_price, expected_move_percent, confidence, reasoning,
+  key_risks_json, technical_score, indicators_json, data_provider, interval,
+  claude_model, prompt_version, raw_claude_response, input_tokens,
+  output_tokens`. `raw_current_price` and the OHLCV columns are populated
+  from the market-data provider before the Claude call, never from Claude's
+  output. `prediction_type` is currently always `'next_hour'`, kept as a
+  column to future-proof the unique constraint.
+- **`intraday_accuracy_evaluations`** — one row per evaluated prediction,
+  unique on `prediction_id`: `id, prediction_id, evaluated_at,
+  evaluation_timestamp, actual_price, predicted_price, abs_error, pct_error,
+  direction_correct, target_hit`. `FOREIGN KEY (prediction_id) REFERENCES
+  intraday_predictions(id)`.
+
+These are entirely separate from the daily `predictions`/`accuracy_evaluations`
+tables — no row, join, or query is shared between the two systems.
+
+### 15.7 Accuracy methodology
+
+`src/accuracy/intraday_scorer.py::run_intraday_accuracy_evaluation()` finds
+every `intraday_predictions` row whose `evaluation_timestamp` has already
+occurred and has no matching row yet in `intraday_accuracy_evaluations`
+(`LEFT JOIN ... WHERE a.id IS NULL`, the same pattern as the daily scorer).
+For each, `evaluate_intraday_prediction()`:
+
+- Fetches the cached hourly bar(s) strictly after `prediction_timestamp` up
+  through `evaluation_timestamp` from `intraday_price_bars`. If the bar
+  timestamped exactly at `evaluation_timestamp` isn't cached yet, the
+  prediction is left unevaluated and picked up by a later run.
+- `actual_price` — the `close` of that evaluation-timestamp bar
+  (provider data only, never anything Claude returned).
+- `direction_correct` — for `BULLISH`, whether `actual_price >
+  raw_current_price`; for `BEARISH`, whether `actual_price <
+  raw_current_price`; for `NEUTRAL`, whether the absolute move is under
+  0.2% of `raw_current_price`.
+- `target_hit` — computed from that same bar's `high`/`low` (its window):
+  for `BULLISH`, whether the bar's high reached `predicted_price`; for
+  `BEARISH`, whether the bar's low reached `predicted_price`; for
+  `NEUTRAL`, whether `predicted_price` fell within `[low, high]`. (This is
+  based on the one 60-minute bar spanning the prediction-to-evaluation
+  window; there is no separate finer-grained, e.g. 5-minute, bar lookup in
+  the current implementation.)
+- `abs_error` / `pct_error` — `|actual_price - predicted_price|`, and that
+  as a percentage of `raw_current_price`.
+
+Aggregates (direction accuracy, average error, best/worst per-symbol) are
+computed on read directly from these tables — nothing is pre-aggregated or
+cached.
+
+### 15.8 Excel report
+
+`src/reporting/intraday_excel_report.py::generate_intraday_report()` writes
+`reports/intraday/YYYY-MM-DD.xlsx`, **exactly one worksheet** (`ws.title =
+"Intraday"`), updated in place after every run for that day (write to a
+`.tmp` file, then `Path.replace()` — an atomic rename — over the target;
+`generate_report()` was never given a second sheet to accidentally create).
+Layout:
+
+- **Row 1** — run timestamp, market status, processed/skipped counts.
+- **Row 2** — average confidence, direction accuracy so far, average error,
+  tokens used today.
+- **Row 3** — best and worst symbol by `pct_error` among evaluated
+  predictions so far.
+- **Row 4** — a one-line legend of the indicator periods, checkpoint list,
+  and data provider.
+- **Row 5** — blank.
+- **Rows 6–7** — a two-row header: a merged top row per hour-checkpoint
+  (`10:15`, `11:15`, ... — merged across its 5 sub-columns), and a sub-row
+  with `Predicted / Actual / Error % / Direction / Confidence %` under each,
+  after an initial `Stock | 09:15 Actual` pair of columns for the
+  market-open tick.
+- **Rows 8+** — one row per symbol in universe order; cells for a
+  checkpoint that hasn't happened/been evaluated yet are left blank, never
+  fabricated.
+
+Frozen panes are set at `C{header_row + 2}` (column C, just below the
+header rows) so the stock-name column and summary block stay visible while
+scrolling right through the day's accumulating hour-blocks.
+
+### 15.9 launchd installation
+
+1. Copy the plist into the LaunchAgents directory:
+   ```bash
+   cp launchd/com.stockagent.intraday.plist ~/Library/LaunchAgents/
+   ```
+2. Edit `~/Library/LaunchAgents/com.stockagent.intraday.plist` and replace
+   the placeholder paths with real absolute paths on your machine:
+   - `<key>WorkingDirectory</key>` — `/REPLACE/WITH/ABSOLUTE/PATH/TO/india-stock-agent`
+     → the actual absolute path to this repository checkout.
+   - `<key>StandardOutPath</key>` and `<key>StandardErrorPath</key>` —
+     both currently `/REPLACE/WITH/HOME/Library/Logs/stockagent-intraday...` →
+     your actual home directory (e.g. `/Users/you/Library/Logs/...`).
+3. Load it:
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.stockagent.intraday.plist
+   ```
+4. To stop it:
+   ```bash
+   launchctl unload ~/Library/LaunchAgents/com.stockagent.intraday.plist
+   ```
+
+The plist's `StartCalendarInterval` fires at **09:25, 10:25, 11:25, 12:25,
+13:25, 14:25, 15:25** every day — it deliberately has **no `Weekday`
+restriction** (verified by `tests/test_launchd_plist.py`). `launchd` is
+treated purely as a coarse, always-fire trigger; `IntradayMarketCalendar`'s
+trading-day and eligibility-window check inside the application is the real
+authority that no-ops safely on weekends, holidays, and any other
+non-eligible time. Logs go to `~/Library/Logs/stockagent-intraday.log`
+(stdout) and `~/Library/Logs/stockagent-intraday-error.log` (stderr), per
+the plist's `StandardOutPath`/`StandardErrorPath`; the application's own
+per-day log file (`logs/intraday-YYYY-MM-DD.log`, written by
+`src/run_intraday.py`) is separate from these.
+
+### 15.10 Cost
+
+Six prediction-generating checkpoints × 20 stocks = **120 Claude calls per
+trading day** for the intraday system, on top of the daily system's
+existing 20 calls/day — **140 calls/day combined**. No Claude calls occur
+anywhere else in the intraday pipeline (accuracy scoring, indicator
+computation, Excel generation, and the checkpoint gate are all pure local
+Python). Every `request_prediction()` call persists
+`response.usage.input_tokens`/`output_tokens` directly onto the
+`intraday_predictions` row (columns `input_tokens`, `output_tokens`), so
+token totals survive a mid-day process restart. The Excel report's Row 2
+"Tokens used today" figure and any daily total are simple `SUM()` queries
+over that day's `intraday_predictions` rows, not an in-memory running
+counter.
+
+### 15.11 Known limitations
+
+- **~15-minute data delay** — the free `yfinance`/Yahoo intraday feed is
+  approximately 15 minutes delayed, not real time. The "current price" used
+  at any checkpoint (for both prediction generation and later evaluation)
+  reflects this delay consistently on both sides, so accuracy comparisons
+  stay internally consistent, but the system is not suitable for anything
+  requiring true real-time prices.
+- **1-minute bars are only available for ~7–8 days** from `yfinance` — not
+  used by this design (which relies on 60-minute bars, available for up to
+  ~730 days), but it rules out very short-horizon backtesting later without
+  a different provider.
+- **No SLA on the free feed** — Yahoo can change or throttle the endpoint
+  without notice. `MarketDataProvider` is an interface specifically so a
+  future paid provider can be substituted (via `get_intraday_history`/
+  `get_latest_intraday_price`) without touching `intraday_engine.py`,
+  `intraday_scorer.py`, or `intraday_excel_report.py`.
+- **3:15 PM close boundary behavior is worth a live spot-check** — the
+  checkpoint grid (ending at 15:15, with continuous trading for F&O stocks
+  ending at 15:15 IST) was derived from research and a historical data pull
+  performed on a non-trading day; the exact behavior of the feed right at
+  the close boundary should be reconfirmed on the first live trading day.
+
+### 15.12 Relationship to the daily system
+
+The daily and intraday systems are independent by design:
+
+- **Shared:** the SQLite database file (`config.settings.DB_PATH`) and the
+  universe/weights configuration (`src/universe/nifty50_weights.py`,
+  `TOP_N`). Both also read `config/settings.py` for non-secret tunables and
+  the same `ANTHROPIC_API_KEY` environment variable.
+- **Not shared:** tables (`predictions`/`accuracy_evaluations` vs.
+  `intraday_predictions`/`intraday_accuracy_evaluations`/
+  `intraday_price_bars`), prediction logic (`prediction/engine.py` vs.
+  `prediction/intraday_engine.py`), accuracy logic (`accuracy/scorer.py` vs.
+  `accuracy/intraday_scorer.py`), reports
+  (`reporting/excel_report.py` vs. `reporting/intraday_excel_report.py`),
+  and CLI entrypoints (`run_daily.py` vs. `run_intraday.py`).
+- No code path in either system imports from or calls into the other's
+  prediction, accuracy, or reporting modules.
