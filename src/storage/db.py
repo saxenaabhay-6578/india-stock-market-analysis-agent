@@ -81,6 +81,50 @@ CREATE TABLE IF NOT EXISTS accuracy_evaluations (
     max_adverse_excursion REAL NOT NULL,
     FOREIGN KEY (prediction_id) REFERENCES predictions(id)
 );
+
+CREATE TABLE IF NOT EXISTS intraday_price_bars (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
+    volume INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    UNIQUE(symbol, timestamp, interval)
+);
+
+CREATE TABLE IF NOT EXISTS intraday_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    prediction_timestamp TEXT NOT NULL,
+    evaluation_timestamp TEXT NOT NULL,
+    prediction_type TEXT NOT NULL,
+    raw_current_price REAL NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+    direction TEXT NOT NULL, predicted_price REAL NOT NULL,
+    expected_move_percent REAL NOT NULL, confidence REAL NOT NULL,
+    reasoning TEXT NOT NULL, key_risks_json TEXT NOT NULL,
+    technical_score REAL NOT NULL, indicators_json TEXT NOT NULL,
+    data_provider TEXT NOT NULL, interval TEXT NOT NULL,
+    claude_model TEXT NOT NULL, prompt_version TEXT NOT NULL, raw_claude_response TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+    UNIQUE(symbol, prediction_timestamp, prediction_type)
+);
+
+CREATE TABLE IF NOT EXISTS intraday_accuracy_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL REFERENCES intraday_predictions(id),
+    evaluated_at TEXT NOT NULL,
+    evaluation_timestamp TEXT NOT NULL,
+    actual_price REAL NOT NULL,
+    predicted_price REAL NOT NULL,
+    abs_error REAL NOT NULL, pct_error REAL NOT NULL,
+    direction_correct INTEGER NOT NULL,
+    target_hit INTEGER NOT NULL,
+    UNIQUE(prediction_id)
+);
 """
 
 
@@ -167,3 +211,62 @@ def insert_accuracy_evaluation(conn: sqlite3.Connection, evaluation: dict) -> No
         evaluation,
     )
     conn.commit()
+
+
+def insert_intraday_price_bar_rows(conn: sqlite3.Connection, rows: list[dict]) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO intraday_price_bars "
+        "(symbol, timestamp, interval, open, high, low, close, volume, source, fetched_at) "
+        "VALUES (:symbol, :timestamp, :interval, :open, :high, :low, :close, :volume, :source, :fetched_at)",
+        rows,
+    )
+    conn.commit()
+
+
+def get_intraday_price_bars(
+    conn: sqlite3.Connection, symbol: str, interval: str, start: str | None = None,
+    end: str | None = None, start_exclusive: bool = False,
+) -> pd.DataFrame:
+    start_operator = ">" if start_exclusive else ">="
+    query = "SELECT timestamp, open, high, low, close, volume FROM intraday_price_bars WHERE symbol = ? AND interval = ?"
+    params: list = [symbol, interval]
+    if start:
+        query += f" AND timestamp {start_operator} ?"
+        params.append(start)
+    if end:
+        query += " AND timestamp <= ?"
+        params.append(end)
+    query += " ORDER BY timestamp"
+    return pd.read_sql_query(query, conn, params=params)
+
+
+def insert_intraday_prediction_row(conn: sqlite3.Connection, row: dict) -> int:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO intraday_predictions "
+        "(created_at, symbol, prediction_timestamp, evaluation_timestamp, prediction_type, "
+        "raw_current_price, open, high, low, close, volume, direction, predicted_price, "
+        "expected_move_percent, confidence, reasoning, key_risks_json, technical_score, "
+        "indicators_json, data_provider, interval, claude_model, prompt_version, "
+        "raw_claude_response, input_tokens, output_tokens) VALUES "
+        "(:created_at, :symbol, :prediction_timestamp, :evaluation_timestamp, :prediction_type, "
+        ":raw_current_price, :open, :high, :low, :close, :volume, :direction, :predicted_price, "
+        ":expected_move_percent, :confidence, :reasoning, :key_risks_json, :technical_score, "
+        ":indicators_json, :data_provider, :interval, :claude_model, :prompt_version, "
+        ":raw_claude_response, :input_tokens, :output_tokens)",
+        row,
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def insert_intraday_accuracy_evaluation(conn: sqlite3.Connection, evaluation: dict) -> int:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO intraday_accuracy_evaluations "
+        "(prediction_id, evaluated_at, evaluation_timestamp, actual_price, predicted_price, "
+        "abs_error, pct_error, direction_correct, target_hit) VALUES "
+        "(:prediction_id, :evaluated_at, :evaluation_timestamp, :actual_price, :predicted_price, "
+        ":abs_error, :pct_error, :direction_correct, :target_hit)",
+        evaluation,
+    )
+    conn.commit()
+    return cursor.rowcount

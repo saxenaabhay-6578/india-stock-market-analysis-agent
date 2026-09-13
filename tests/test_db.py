@@ -229,3 +229,84 @@ def test_insert_accuracy_evaluation_inserts_and_rounds_trip(tmp_path):
     assert result["direction_correct"] == 1
     assert result["target_hit"] == 1
     conn.close()
+
+
+def test_insert_intraday_price_bar_rows_and_idempotent_reinsert(tmp_path):
+    conn = db.get_connection(tmp_path / "test.db")
+    rows = [
+        {"symbol": "RELIANCE.NS", "timestamp": "2026-09-14T09:15:00+05:30", "interval": "60m",
+         "open": 1450.0, "high": 1455.0, "low": 1448.0, "close": 1452.0, "volume": 10000,
+         "source": "yfinance", "fetched_at": "2026-09-14T09:27:00+00:00"},
+        {"symbol": "RELIANCE.NS", "timestamp": "2026-09-14T10:15:00+05:30", "interval": "60m",
+         "open": 1452.0, "high": 1460.0, "low": 1450.0, "close": 1458.0, "volume": 12000,
+         "source": "yfinance", "fetched_at": "2026-09-14T10:27:00+00:00"},
+    ]
+    db.insert_intraday_price_bar_rows(conn, rows)
+    db.insert_intraday_price_bar_rows(conn, rows)  # duplicate attempt
+    count = conn.execute("SELECT COUNT(*) FROM intraday_price_bars").fetchone()[0]
+    assert count == 2
+
+    fetched = db.get_intraday_price_bars(conn, "RELIANCE.NS", "60m")
+    assert len(fetched) == 2
+    assert list(fetched["timestamp"]) == ["2026-09-14T09:15:00+05:30", "2026-09-14T10:15:00+05:30"]
+    conn.close()
+
+
+def test_get_intraday_price_bars_start_exclusive(tmp_path):
+    conn = db.get_connection(tmp_path / "test.db")
+    rows = [
+        {"symbol": "TCS.NS", "timestamp": f"2026-09-14T{h:02d}:15:00+05:30", "interval": "60m",
+         "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000,
+         "source": "yfinance", "fetched_at": "2026-09-14T00:00:00+00:00"}
+        for h in [9, 10, 11]
+    ]
+    db.insert_intraday_price_bar_rows(conn, rows)
+    result = db.get_intraday_price_bars(
+        conn, "TCS.NS", "60m", start="2026-09-14T09:15:00+05:30", start_exclusive=True,
+    )
+    assert list(result["timestamp"]) == ["2026-09-14T10:15:00+05:30", "2026-09-14T11:15:00+05:30"]
+    conn.close()
+
+
+def _sample_intraday_prediction_row(**overrides):
+    row = dict(
+        created_at="2026-09-14T09:27:00+00:00", symbol="RELIANCE.NS",
+        prediction_timestamp="2026-09-14T09:15:00+05:30", evaluation_timestamp="2026-09-14T10:15:00+05:30",
+        prediction_type="next_hour", raw_current_price=1450.0,
+        open=1450.0, high=1450.0, low=1450.0, close=1450.0, volume=0,
+        direction="BULLISH", predicted_price=1465.0, expected_move_percent=1.03, confidence=65.0,
+        reasoning="uptrend", key_risks_json="[\"macro risk\"]", technical_score=42.5,
+        indicators_json="{}", data_provider="yfinance", interval="60m",
+        claude_model="claude-sonnet-5", prompt_version="intraday-v1", raw_claude_response="{}",
+        input_tokens=650, output_tokens=400,
+    )
+    row.update(overrides)
+    return row
+
+
+def test_insert_intraday_prediction_row_returns_rowcount_and_enforces_uniqueness(tmp_path):
+    conn = db.get_connection(tmp_path / "test.db")
+    row = _sample_intraday_prediction_row()
+    inserted = db.insert_intraday_prediction_row(conn, row)
+    assert inserted == 1
+    duplicate_attempt = db.insert_intraday_prediction_row(conn, row)
+    assert duplicate_attempt == 0
+    count = conn.execute("SELECT COUNT(*) FROM intraday_predictions").fetchone()[0]
+    assert count == 1
+    conn.close()
+
+
+def test_insert_intraday_accuracy_evaluation_returns_rowcount_and_enforces_uniqueness(tmp_path):
+    conn = db.get_connection(tmp_path / "test.db")
+    db.insert_intraday_prediction_row(conn, _sample_intraday_prediction_row())
+    prediction_id = conn.execute("SELECT id FROM intraday_predictions").fetchone()[0]
+    evaluation = dict(
+        prediction_id=prediction_id, evaluated_at="2026-09-14T10:27:00+00:00",
+        evaluation_timestamp="2026-09-14T10:15:00+05:30", actual_price=1458.0, predicted_price=1465.0,
+        abs_error=7.0, pct_error=0.48, direction_correct=1, target_hit=0,
+    )
+    first = db.insert_intraday_accuracy_evaluation(conn, evaluation)
+    assert first == 1
+    second = db.insert_intraday_accuracy_evaluation(conn, evaluation)
+    assert second == 0
+    conn.close()
