@@ -284,6 +284,21 @@ def test_find_missed_checkpoints_detects_a_gap(tmp_path):
     conn.close()
 
 
+def test_09_15_checkpoint_caches_intraday_price_bars(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    checkpoint = datetime(2026, 9, 15, 9, 15, tzinfo=IST)
+    provider = _FakeProvider(_hourly_frame(checkpoint), latest_tick=(checkpoint, 1449.75))
+    client = _FakeClient()
+
+    run_intraday_pipeline(["RELIANCE.NS"], checkpoint, conn, provider, client, output_dir=tmp_path / "reports")
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM intraday_price_bars WHERE symbol = 'RELIANCE.NS' AND interval = '60m'"
+    ).fetchone()[0]
+    assert count > 0
+    conn.close()
+
+
 def test_recovery_run_never_fabricates_predictions_for_missed_checkpoints(tmp_path):
     conn = get_connection(tmp_path / "test.db")
     checkpoint_0915 = datetime(2026, 9, 15, 9, 15, tzinfo=IST)

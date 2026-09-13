@@ -128,6 +128,7 @@ def run_intraday_pipeline(
                     )
                     continue
 
+            needs_caching = history_for_indicators is None
             if history_for_indicators is None:
                 history_for_indicators = provider.get_intraday_history(
                     symbol, start=start, end=checkpoint, interval=INTRADAY_INTERVAL,
@@ -136,6 +137,17 @@ def run_intraday_pipeline(
                 logger.warning("Skipping %s: no indicator history", symbol)
                 skipped += 1
                 continue
+            if needs_caching and not dry_run:
+                rows = [
+                    {
+                        "symbol": symbol, "timestamp": r["timestamp"].isoformat(), "interval": INTRADAY_INTERVAL,
+                        "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
+                        "close": float(r["close"]), "volume": int(r["volume"]), "source": "yfinance",
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    for _, r in history_for_indicators.iterrows()
+                ]
+                db.insert_intraday_price_bar_rows(conn, rows)
             filtered = select_bars_up_to_checkpoint(history_for_indicators, checkpoint)
             if filtered.empty:
                 logger.warning("Skipping %s: no bars available before checkpoint", symbol)
